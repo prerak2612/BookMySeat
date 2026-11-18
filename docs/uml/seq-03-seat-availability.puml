@@ -1,0 +1,50 @@
+@startuml seq-03-seat-availability
+title Sequence 3 - Seat layout and real-time availability (Observer polling)
+autonumber
+actor Customer
+participant SeatSelectionPage as Page
+participant SeatAvailabilityPoller as Poller
+participant "SeatMap\n(component)" as Grid
+participant HttpClient as Http
+participant ShowController
+participant SeatAvailabilityService as Svc
+participant PgShowRepository as Shows
+participant PgShowSeatRepository as SeatsRepo
+participant "ShowSeat\n(domain)" as SS
+participant CategoryPricingStrategy as Pricing
+database PostgreSQL as DB
+
+Customer -> Page : open /shows/:id
+Page -> Poller : new SeatAvailabilityPoller(showId, api.shows.seats, 5000)
+Page -> Poller : subscribe(setState) via useObservable
+Page -> Poller : start()
+loop every 5 seconds (and on demand via refresh())
+  Poller -> Http : api.shows.seats(showId)
+  Http -> ShowController : GET /api/shows/:id/seats
+  ShowController -> Svc : getSeatMap(showId)
+  Svc -> Shows : findDetails(showId, now)
+  Shows -> DB : SELECT show + movie + theatre
+  Svc -> SeatsRepo : findByShow(showId)
+  SeatsRepo -> DB : SELECT show_seats JOIN seats (no lock)
+  DB --> SeatsRepo : rows
+  SeatsRepo --> Svc : ShowSeat[]
+  loop for each ShowSeat
+    Svc -> SS : effectiveStatus(now)
+    note right : expired LOCKED is reported as AVAILABLE
+    Svc -> Pricing : priceForSeat(category, basePrice)
+  end
+  Svc --> ShowController : SeatMap {rows, summary, categoryPrices, serverTime}
+  ShowController --> Http : 200
+  Http --> Poller : SeatMap
+  Poller -> Poller : emit({seatMap, loading: false})
+  Poller --> Page : notify subscribers
+  Page -> Page : pruneUnavailable(selected, seatMap)
+  Page -> Grid : render(seatMap, selected)
+  Grid --> Customer : seats: available / selected / locked / booked
+end
+Customer -> Grid : click seat
+Grid -> Page : onSeatClick(seat)
+Page -> Page : strategy.onSeatClick(seat, ctx)\n(ManualSelectionStrategy | ContiguousBlockStrategy)
+note over Page : Selection is local UI state only -\nthe server re-validates when seats are held.
+Page -> Poller : stop() on unmount
+@enduml

@@ -1,0 +1,66 @@
+@startuml seq-07-payment-success
+title Sequence 7 - Payment success (POST /api/bookings/:id/payments)
+autonumber
+actor Customer
+participant CheckoutPage as Page
+participant "PaymentFormFactory\n(card strategy)" as Form
+participant BookingController as Ctrl
+participant BookingService as BS
+participant TransactionManager as TM
+participant SeatLockService as SLS
+participant PgShowSeatRepository as Seats
+participant PgBookingRepository as Bookings
+participant PgPaymentRepository as Payments
+participant PaymentService as PS
+participant PaymentStrategyFactory as PSF
+participant CardPaymentStrategy as Card
+participant LegacyPayGatewayAdapter as Adapter
+participant LegacyPaySdk as SDK
+participant BookingEventPublisher as Pub
+participant NotificationService as Notif
+database PostgreSQL as DB
+
+Customer -> Page : fill card details, click Pay
+Page -> Form : validate(values)  (UX only)
+Page -> Ctrl : POST /bookings/:id/payments {method: CARD, details}\nIdempotency-Key: pay-...
+Ctrl -> BS : pay(user, bookingId, {method, details}, key)
+BS -> TM : transaction(work) -> BEGIN
+BS -> SLS : lockBookingForUpdate(uow, bookingId)
+SLS -> Bookings : findById(bookingId) (snapshot of active lines)
+SLS -> Seats : findByIds(showSeatIds, {forUpdate: true})
+Seats -> DB : SELECT ... ORDER BY ss.id FOR UPDATE OF ss
+SLS -> Bookings : findById(bookingId, {forUpdate: true})
+Bookings -> DB : SELECT * FROM bookings ... FOR UPDATE
+SLS --> BS : {booking, seats}
+BS -> BS : authorize(user, booking)
+BS -> Payments : findByBookingAndKey(bookingId, key)
+Payments --> BS : null (not a replay)
+BS -> BS : booking.isHoldExpired(now) == false\nbooking.assertPayable(now)
+BS -> SLS : assertStillHeld(booking, seats, now)
+BS -> PS : charge(CARD, totalAmount, reference, details)
+PS -> PSF : get(CARD)
+PSF --> PS : CardPaymentStrategy
+PS -> Card : pay({amount, bookingReference, details})
+Card -> Card : validate(details) / tokenise() / mask()
+Card -> Adapter : charge({amount, instrumentType: CARD, token, reference})
+Adapter -> SDK : makeTransaction({amount_paise, 'CC', ...}, callback)
+SDK --> Adapter : callback(null, {code: '00', txn_id})
+Adapter --> Card : GatewayResult {approved: true, transactionRef}
+Card --> PS : PaymentResult {success: true}
+PS --> BS : PaymentResult
+BS -> Payments : create({status: SUCCESS, transactionRef, idempotencyKey})
+BS -> SLS : confirmSeats(uow, booking, seats, now)
+SLS -> SLS : seat.book(bookingId, now) for each
+SLS -> Seats : markBooked(ids, bookingId)
+Seats -> DB : UPDATE show_seats SET status='BOOKED' WHERE status='LOCKED' AND booking_id=$2
+BS -> BS : booking.confirm(now)
+BS -> Bookings : save(booking)
+TM -> DB : COMMIT
+BS -> Pub : publish(BOOKING_CONFIRMED)  (after commit)
+Pub -> Notif : handle(event)
+Notif -> DB : INSERT notifications (EMAIL, SMS)
+BS -> Bookings : findSummary(bookingId)
+BS --> Ctrl : BookingView (CONFIRMED)
+Ctrl --> Page : 200
+Page --> Customer : /bookings/:id/confirmation (ticket)
+@enduml

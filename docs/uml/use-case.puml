@@ -1,0 +1,68 @@
+@startuml use-case
+title BookMySeat - Use Case Diagram
+left to right direction
+skinparam packageStyle rectangle
+
+actor Customer as C
+actor Admin as A
+actor "Hold Expiry Job" as J <<system>>
+A -|> C
+
+rectangle "BookMySeat" {
+  usecase "Register" as UC_REG
+  usecase "Log in" as UC_LOGIN
+  usecase "Browse / search movies" as UC_BROWSE
+  usecase "View movie details" as UC_DETAILS
+  usecase "View shows\n(by day / city / theatre)" as UC_SHOWS
+  usecase "View seat map &\nreal-time availability" as UC_SEATS
+  usecase "Hold seats\n(temporary lock)" as UC_HOLD
+  usecase "Pay for booking\n(simulated)" as UC_PAY
+  usecase "Validate seat hold" as UC_VALIDATE
+  usecase "View booking confirmation" as UC_CONFIRM
+  usecase "View booking history" as UC_HISTORY
+  usecase "Cancel booking /\nrelease hold" as UC_CANCEL
+  usecase "Refund payment" as UC_REFUND
+  usecase "View notifications" as UC_NOTIF
+  usecase "Expire abandoned holds" as UC_EXPIRE
+
+  usecase "Manage movies\n(create / update / deactivate)" as UC_MOVIES
+  usecase "Manage theatres" as UC_THEATRES
+  usecase "Add screen with seat layout" as UC_SCREENS
+  usecase "Schedule show" as UC_SCHEDULE
+  usecase "View dashboard statistics" as UC_STATS
+  usecase "View all bookings" as UC_ALLBOOKINGS
+}
+
+C --> UC_REG
+C --> UC_LOGIN
+C --> UC_BROWSE
+C --> UC_DETAILS
+C --> UC_SHOWS
+C --> UC_SEATS
+C --> UC_HOLD
+C --> UC_PAY
+C --> UC_CONFIRM
+C --> UC_HISTORY
+C --> UC_CANCEL
+C --> UC_NOTIF
+
+A --> UC_MOVIES
+A --> UC_THEATRES
+A --> UC_SCREENS
+A --> UC_SCHEDULE
+A --> UC_STATS
+A --> UC_ALLBOOKINGS
+
+J --> UC_EXPIRE
+
+UC_HOLD ..> UC_SEATS : <<include>>
+UC_PAY ..> UC_VALIDATE : <<include>>
+UC_REFUND ..> UC_CANCEL : <<extend>>\n(confirmed booking,\nbefore cut-off)
+
+note right of UC_HOLD
+  Requires login.
+  Idempotency-Key header supported.
+  Concurrency-safe: at most one
+  active hold per show seat.
+end note
+@enduml

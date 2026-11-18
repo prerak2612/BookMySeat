@@ -1,0 +1,104 @@
+@startuml activity-booking
+title Activity - Complete booking workflow
+start
+:Customer opens seat map (/shows/:id);
+:SeatAvailabilityPoller polls GET /shows/:id/seats every 5 s;
+repeat
+  :Select seats (Manual or ContiguousBlock strategy);
+  :Click "Hold seats";
+  if (Logged in?) then (no)
+    :Redirect to /login, then back;
+  endif
+  partition "POST /api/bookings (one DB transaction)" {
+    :Validate request (zod HoldBody, duplicates, max seats);
+    if (Idempotency-Key already used by this user?) then (yes)
+      :Return existing booking (200 replayed);
+      detach
+    endif
+    :Check show is SCHEDULED and not started;
+    :Lock seat rows (SELECT ... FOR UPDATE)\nor read versions (optimistic);
+    if (All seats exist?) then (no)
+      :404 NOT_FOUND;
+      stop
+    endif
+    if (Every seat AVAILABLE or lock expired?) then (no)
+      :ROLLBACK;
+      :409 SEAT_UNAVAILABLE;
+    else (yes)
+      :Re-claim expired locks\n(deactivate old lines, mark old booking EXPIRED);
+      :Price seats (strategy + decorators);
+      :Build BookingDraft (BookingBuilder);
+      :INSERT booking (PENDING, expires_at = now + hold);
+      :Seats -> LOCKED (claim);
+      :INSERT booking_seats (unique active index);
+      :COMMIT;
+    endif
+  }
+  backward :UI refreshes seat map,\nprunes taken seats;
+repeat while (Hold acquired?) is (no) not (yes)
+
+:Checkout page shows price breakdown + countdown;
+fork
+  :Customer fills payment form;
+fork again
+  :HoldExpiryJob runs every 30 s;
+  if (Hold expired and still PENDING?) then (yes)
+    :Booking EXPIRED, seats AVAILABLE,\nBOOKING_EXPIRED notification;
+  endif
+end fork
+
+if (Customer releases seats?) then (yes)
+  :POST /bookings/:id/cancel -> CANCELLED, seats AVAILABLE;
+  stop
+endif
+
+repeat
+  partition "POST /api/bookings/:id/payments (one DB transaction)" {
+    :Lock booking's seats FOR UPDATE, then booking FOR UPDATE;
+    if (Same Idempotency-Key already paid?) then (yes)
+      :Return original result;
+      stop
+    endif
+    if (Hold expired?) then (yes)
+      :Expire booking, release seats, COMMIT;
+      :410 HOLD_EXPIRED -> choose seats again;
+      stop
+    endif
+    if (Booking payable and seats still held?) then (no)
+      :ROLLBACK;
+      :409 already paid / invalid state;
+      stop
+    endif
+    :PaymentService.charge() -> strategy -> adapter -> gateway;
+  }
+  if (Gateway reachable?) then (no)
+    :Exception -> ROLLBACK\n(hold untouched, nothing persisted);
+    :500 - user may retry;
+  endif
+repeat while (Retry after outage?) is (yes) not (no / answered)
+
+if (Approved?) then (yes)
+  :Payment SUCCESS;
+  :Seats LOCKED -> BOOKED;
+  :Booking PENDING -> CONFIRMED;
+  :COMMIT;
+  :Publish BOOKING_CONFIRMED\n(e-mail + SMS notification);
+  :Show confirmation ticket;
+  if (Customer cancels later?) then (yes)
+    if (>= cut-off before show start?) then (yes)
+      :Refund via payment strategy;
+      :Payment REFUNDED, booking CANCELLED,\nseats AVAILABLE, COMMIT;
+      :Publish BOOKING_CANCELLED;
+    else (no)
+      :422 CANCELLATION_WINDOW_CLOSED;
+    endif
+  endif
+else (declined)
+  :Payment FAILED;
+  :Booking FAILED, seats released;
+  :COMMIT;
+  :Publish PAYMENT_FAILED;
+  :402 PAYMENT_FAILED -> choose seats again;
+endif
+stop
+@enduml

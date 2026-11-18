@@ -1,0 +1,64 @@
+@startuml seq-05-concurrent-booking
+title Sequence 5 - Concurrent booking attempts for the same seat (A1, show S1)
+autonumber
+actor "User A" as UA
+actor "User B" as UB
+participant "BookingService\n(request A)" as BSA
+participant "BookingService\n(request B)" as BSB
+participant SeatLockService as SLS
+participant PessimisticSeatLockingStrategy as Strat
+participant PgShowSeatRepository as Seats
+database PostgreSQL as DB
+
+par simultaneous requests
+  UA -> BSA : POST /api/bookings {S1, [A1]}
+else
+  UB -> BSB : POST /api/bookings {S1, [A1]}
+end
+
+BSA -> DB : BEGIN (txn A)
+BSB -> DB : BEGIN (txn B)
+BSA -> SLS : hold(uowA, ...)
+SLS -> Strat : reserveCandidates(uowA, S1, [A1], now)
+Strat -> Seats : findByShowAndSeatIds(..., {forUpdate: true})
+Seats -> DB : SELECT ... FOR UPDATE OF ss (txn A)
+DB --> Seats : A1 AVAILABLE - row lock granted to A
+
+BSB -> SLS : hold(uowB, ...)
+SLS -> Strat : reserveCandidates(uowB, S1, [A1], now)
+Strat -> Seats : findByShowAndSeatIds(..., {forUpdate: true})
+Seats -> DB : SELECT ... FOR UPDATE OF ss (txn B)
+activate DB #FFCCCC
+note right of DB : txn B BLOCKS on A1's row lock
+
+SLS -> DB : bookings.createHeader / Strat.claim -> showSeats.lockSeats / bookings.addLines (txn A)
+note right of SLS : INSERT booking, UPDATE A1 -> LOCKED, INSERT booking_seats line
+BSA -> DB : COMMIT (txn A) - lock released
+BSA --> UA : 201 Created (hold acquired)
+
+DB --> Seats : txn B wakes up and re-reads the COMMITTED row:\nA1 is LOCKED by booking of A
+deactivate DB
+Seats --> Strat : ShowSeat(A1, LOCKED)
+Strat -> Strat : isAvailableAt(now) == false
+Strat --> BSB : throw SeatUnavailableError([A1])
+BSB -> DB : ROLLBACK (txn B) - nothing persisted
+BSB --> UB : 409 SEAT_UNAVAILABLE
+
+alt SEAT_LOCK_STRATEGY = OPTIMISTIC
+  note over Strat, DB
+    Both transactions read A1 (version v) WITHOUT locks.
+    Both run UPDATE show_seats ... WHERE id = A1 AND version = v.
+    B's UPDATE waits for A's row lock; after A commits PostgreSQL re-checks
+    the WHERE clause: version is now v+1 -> 0 rows updated.
+    OptimisticSeatLockingStrategy.claim() sees updated < requested
+    -> SeatUnavailableError -> ROLLBACK -> 409.
+  end note
+end
+
+note over BSA, DB
+  Last line of defence (both strategies): partial unique index
+  ux_booking_seats_one_active_per_show_seat ON booking_seats(show_seat_id) WHERE is_active.
+  A second active line raises SQLSTATE 23505, mapped to SeatUnavailableError (409).
+  Verified by tests/concurrency/booking-concurrency.test.ts with 50 simultaneous requests.
+end note
+@enduml

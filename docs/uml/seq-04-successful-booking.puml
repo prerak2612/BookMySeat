@@ -1,0 +1,69 @@
+@startuml seq-04-successful-booking
+title Sequence 4 - Successful seat hold (POST /api/bookings, pessimistic strategy)
+autonumber
+actor Customer
+participant SeatSelectionPage as Page
+participant "authenticate +\nvalidate(HoldBody)" as MW
+participant BookingController as Ctrl
+participant BookingService as BS
+participant PgUnitOfWorkFactory as UoWF
+participant TransactionManager as TM
+participant PgAdvisoryLockRepository as Adv
+participant PgBookingRepository as Bookings
+participant PgShowRepository as Shows
+participant SeatLockService as SLS
+participant PessimisticSeatLockingStrategy as Strat
+participant PgShowSeatRepository as Seats
+participant "PriceCalculator\n(decorator chain)" as Price
+participant BookingBuilder as Builder
+database PostgreSQL as DB
+
+Customer -> Page : "Hold N seats & continue"
+Page -> MW : POST /api/bookings {showId, seatIds}\nIdempotency-Key: hold-...
+MW -> MW : AuthService.authenticate(token)\nHoldBody.parse(body)
+MW -> Ctrl : createHold(req, res)
+Ctrl -> BS : createHold(user, {showId, seatIds}, key)
+BS -> BS : reject duplicate seats / > maxSeatsPerBooking
+BS -> UoWF : transaction(work)
+UoWF -> TM : run(work)
+TM -> DB : BEGIN ISOLATION LEVEL READ COMMITTED
+BS -> Adv : lockForTransaction("hold:user:key")
+Adv -> DB : SELECT pg_advisory_xact_lock(hashtextextended(...))
+BS -> Bookings : findByUserAndIdempotencyKey(userId, key)
+Bookings --> BS : null (first attempt)
+BS -> Shows : findById(showId)
+BS -> BS : show.isBookableAt(now)
+BS -> SLS : hold(uow, {showId, seatIds, now, buildDraft})
+SLS -> Strat : reserveCandidates(uow, showId, seatIds, now)
+Strat -> Seats : findByShowAndSeatIds(showId, seatIds, {forUpdate: true})
+Seats -> DB : SELECT ... ORDER BY ss.id FOR UPDATE OF ss
+DB --> Seats : rows (row locks held until COMMIT)
+Strat -> Strat : all exist? all isAvailableAt(now)?
+Strat --> SLS : ShowSeat[]
+SLS -> SLS : reclaimExpiredHolds(uow, seats, now)\n(none expired here)
+SLS -> BS : buildDraft(seats)
+BS -> Price : calculate({show, seats})
+Price --> BS : PriceQuote {seatPrices, subtotal, lines, total}
+BS -> Builder : forUser().forShow().withPricing()\n.withIdempotencyKey().holdUntil().withSeat()*
+Builder --> BS : build(): BookingDraft
+BS --> SLS : BookingDraft
+SLS -> Bookings : createHeader(draft)
+Bookings -> DB : INSERT INTO bookings (status 'PENDING', expires_at)
+SLS -> Strat : claim(uow, seats, bookingId, expiresAt)
+Strat -> Seats : lockSeats(ids, bookingId, expiresAt)
+Seats -> DB : UPDATE show_seats SET status='LOCKED', version=version+1
+SLS -> Bookings : addLines(bookingId, draft.seats)
+Bookings -> DB : INSERT INTO booking_seats\n(guarded by ux_booking_seats_one_active_per_show_seat)
+SLS -> Bookings : findById(bookingId)
+SLS --> BS : Booking (PENDING)
+TM -> DB : COMMIT (row locks released)
+BS -> Bookings : findSummary(bookingId)
+BS --> Ctrl : {booking: BookingView, replayed: false}
+Ctrl --> Page : 201 Created
+Page --> Customer : navigate /checkout/:id (countdown starts)
+
+note over BS, DB
+  Same Idempotency-Key again -> the advisory lock serialises the retry,
+  findByUserAndIdempotencyKey() returns the existing booking -> 200 (replayed).
+end note
+@enduml

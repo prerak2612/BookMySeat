@@ -1,0 +1,35 @@
+@startuml seq-02-show-selection
+title Sequence 2 - Theatre and show selection
+autonumber
+actor Customer
+participant "MovieDetailsPage\n(React)" as Page
+participant HttpClient as Http
+participant "validate(IdParam, ShowQuery)" as MW
+participant MovieController
+participant ShowService
+participant PgMovieRepository as Movies
+participant PgShowRepository as Shows
+database PostgreSQL as DB
+
+Customer -> Page : open /movies/:id
+Page -> Http : api.movies.shows(movieId)
+Http -> MW : GET /api/movies/:id/shows?date=&city=
+MW -> MovieController : shows_(req, res)
+MovieController -> ShowService : listForMovie(movieId, {date, city, theatreId})
+ShowService -> Movies : findById(movieId)
+alt movie missing
+  ShowService --> MovieController : throw NotFoundError (404)
+end
+ShowService -> ShowService : date -> [from, to) range
+ShowService -> Shows : listForMovie(movieId, filter, clock.now())
+Shows -> DB : SELECT shows JOIN screens JOIN theatres\n+ count of AVAILABLE or expired-LOCKED show_seats\nWHERE status = 'SCHEDULED' AND start_time >= now
+DB --> Shows : rows
+Shows --> ShowService : ShowListing[]
+ShowService --> MovieController : ShowListing[]
+MovieController --> Http : 200 data
+Http --> Page : ShowListing[]
+Page -> Page : group by day tab, city, theatre
+Page --> Customer : showtimes (sold out / few left)
+Customer -> Page : click showtime
+Page --> Customer : navigate to /shows/:id (seat selection)
+@enduml

@@ -1,0 +1,45 @@
+@startuml seq-01-movie-browsing
+title Sequence 1 - Movie browsing
+autonumber
+actor Customer
+participant "MoviesPage\n(React)" as Page
+participant "HttpClient" as Http
+participant "Express router\n/api/movies" as Router
+participant "optionalAuthenticate\n+ validate(MovieQuery)" as MW
+participant MovieController
+participant MovieService
+participant "PgMovieRepository\n(MovieReader)" as Repo
+database PostgreSQL as DB
+
+Customer -> Page : open home page
+Page -> Http : api.movies.list()
+Http -> Router : GET /api/movies
+Router -> MW : parse token (optional), validate query
+MW -> MovieController : list(req, res)
+MovieController -> MovieController : req.user?.canManageCatalog()\n(false -> includeInactive = false)
+MovieController -> MovieService : list(filter)
+MovieService -> Repo : search(filter)
+Repo -> DB : SELECT ... FROM movies WHERE is_active\nORDER BY release_date DESC
+DB --> Repo : rows
+Repo --> MovieService : Movie[]
+MovieService --> MovieController : Movie[]
+MovieController --> Http : 200 {success: true, data: movieDto[]}
+Http --> Page : Movie[]
+Page -> Page : client-side filter (search, genre, language)
+Page --> Customer : movie grid
+
+== View movie details ==
+Customer -> Page : click movie card
+Page -> Http : api.movies.get(id)
+Http -> MovieController : GET /api/movies/:id
+MovieController -> MovieService : get(id)
+MovieService -> Repo : findById(id)
+Repo -> DB : SELECT ... WHERE id = $1
+alt movie exists
+  MovieService --> MovieController : Movie
+  MovieController --> Http : 200 movieDto
+else not found
+  MovieService --> MovieController : throw NotFoundError
+  MovieController --> Http : 404 NOT_FOUND (errorHandler)
+end
+@enduml

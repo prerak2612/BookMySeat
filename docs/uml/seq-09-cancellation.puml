@@ -1,0 +1,58 @@
+@startuml seq-09-cancellation
+title Sequence 9 - Booking cancellation (POST /api/bookings/:id/cancel)
+autonumber
+actor Customer
+participant BookingHistoryPage as Page
+participant BookingController as Ctrl
+participant BookingService as BS
+participant TransactionManager as TM
+participant SeatLockService as SLS
+participant "Booking\n(aggregate)" as Agg
+participant PgShowRepository as Shows
+participant PgPaymentRepository as Payments
+participant PaymentService as PS
+participant CardPaymentStrategy as Strategy
+participant LegacyPayGatewayAdapter as Adapter
+participant PgBookingRepository as Bookings
+participant PgShowSeatRepository as Seats
+participant BookingEventPublisher as Pub
+database PostgreSQL as DB
+
+Customer -> Page : "Cancel booking" (confirm dialog)
+Page -> Ctrl : POST /api/bookings/:id/cancel
+Ctrl -> BS : cancel(user, bookingId)
+BS -> TM : BEGIN
+BS -> SLS : lockBookingForUpdate(uow, bookingId)
+SLS -> DB : SELECT show_seats FOR UPDATE, then bookings FOR UPDATE
+BS -> BS : authorize(user, booking)  (403 if not owner/admin)
+BS -> Shows : findById(booking.showId)
+BS -> Agg : cancel(now, show, cancellationCutoffMinutes)
+alt PENDING hold
+  Agg --> BS : {refundRequired: false}
+else CONFIRMED and minutesUntilStart >= cutoff
+  Agg --> BS : {refundRequired: true}
+  BS -> Payments : findSuccessfulByBooking(bookingId)
+  BS -> PS : refund(method, transactionRef, amount)
+  PS -> Strategy : refund(transactionRef, amount)
+  Strategy -> Adapter : refund(transactionRef, amount)
+  Adapter --> Strategy : {approved: true}
+  BS -> BS : payment.markRefunded(now)
+  BS -> Payments : save(payment)  (status REFUNDED)
+else CONFIRMED inside cut-off window
+  Agg --> BS : throw BusinessRuleError(CANCELLATION_WINDOW_CLOSED)
+  TM -> DB : ROLLBACK
+  BS --> Page : 422
+else already CANCELLED / EXPIRED / FAILED
+  Agg --> BS : throw ConflictError
+  TM -> DB : ROLLBACK
+  BS --> Page : 409
+end
+BS -> Bookings : save(booking)  (CANCELLED, lines inactive)
+BS -> SLS : releaseSeats(uow, booking)
+SLS -> Seats : releaseForBooking(bookingId)
+TM -> DB : COMMIT
+BS -> Pub : publish(BOOKING_CANCELLED)  (after commit)
+BS --> Ctrl : BookingView (CANCELLED, paymentStatus REFUNDED)
+Ctrl --> Page : 200
+Page --> Customer : "Booking cancelled. Refund initiated."
+@enduml

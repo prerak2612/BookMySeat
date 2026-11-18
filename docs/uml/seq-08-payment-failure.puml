@@ -1,0 +1,59 @@
+@startuml seq-08-payment-failure
+title Sequence 8 - Payment failure: decline (committed) vs gateway outage (rolled back)
+autonumber
+actor Customer
+participant CheckoutPage as Page
+participant BookingService as BS
+participant TransactionManager as TM
+participant SeatLockService as SLS
+participant PaymentService as PS
+participant UpiPaymentStrategy as Strategy
+participant LegacyPayGatewayAdapter as Adapter
+participant PgPaymentRepository as Payments
+participant PgBookingRepository as Bookings
+participant PgShowSeatRepository as Seats
+participant BookingEventPublisher as Pub
+database PostgreSQL as DB
+
+Customer -> Page : Pay (e.g. UPI "fail@bank" or card ...9999)
+Page -> BS : pay(user, bookingId, {method, details}, key)
+BS -> TM : BEGIN
+BS -> SLS : lockBookingForUpdate(uow, bookingId)
+BS -> BS : assertPayable(now), assertStillHeld(...)
+BS -> PS : charge(method, amount, reference, details)
+PS -> Strategy : pay(request)
+Strategy -> Adapter : charge(...)
+
+alt DECLINED (business outcome)
+  Adapter --> Strategy : {approved: false, message}
+  Strategy --> PS : PaymentResult {success: false, failureReason}
+  PS --> BS : PaymentResult
+  BS -> Payments : create({status: FAILED, failureReason})
+  BS -> BS : booking.markPaymentFailed()  (lines -> inactive)
+  BS -> Bookings : save(booking)  (status FAILED)
+  BS -> SLS : releaseSeats(uow, booking)
+  SLS -> Seats : releaseForBooking(bookingId)
+  Seats -> DB : UPDATE show_seats SET status='AVAILABLE', booking_id=NULL
+  TM -> DB : COMMIT
+  BS -> Pub : publish(PAYMENT_FAILED)
+  BS --> Page : throw PaymentFailedError -> 402 PAYMENT_FAILED\n(details.booking.status = FAILED)
+  Page --> Customer : "Payment failed - seats released", "Choose seats again"
+else GATEWAY OUTAGE (infrastructure failure)
+  Adapter --> Strategy : reject GatewayUnavailableError
+  Strategy --> PS : rejects
+  PS --> BS : rejects
+  BS -> TM : exception propagates
+  TM -> DB : ROLLBACK
+  note right of DB
+    Nothing persisted: no payment row,
+    booking stays PENDING, seats stay LOCKED.
+    The hold survives and the user may retry.
+  end note
+  BS --> Page : 500 INTERNAL_ERROR
+  Page --> Customer : error message; retry allowed
+else HOLD EXPIRED before payment
+  BS -> SLS : expireHold(uow, booking)
+  TM -> DB : COMMIT (booking EXPIRED, seats AVAILABLE)
+  BS --> Page : 410 HOLD_EXPIRED
+end
+@enduml

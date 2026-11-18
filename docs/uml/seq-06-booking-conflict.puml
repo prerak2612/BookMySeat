@@ -1,0 +1,34 @@
+@startuml seq-06-booking-conflict
+title Sequence 6 - Booking conflict handled in the UI (user loses the race)
+autonumber
+actor "User B" as UB
+participant SeatSelectionPage as Page
+participant "api.bookings.hold\n(HttpClient)" as Http
+participant BookingController as Ctrl
+participant BookingService as BS
+participant SeatAvailabilityPoller as Poller
+participant "SeatMap\n(component)" as Grid
+
+UB -> Page : selects A1 (still shown as available)
+UB -> Page : click "Hold 1 seat & continue"
+Page -> Page : holdKey.current ??= newIdempotencyKey('hold')
+Page -> Http : hold(showId, [A1], holdKey)
+Http -> Ctrl : POST /api/bookings
+Ctrl -> BS : createHold(user, input, key)
+BS --> Ctrl : throw SeatUnavailableError
+Ctrl --> Http : 409 {code: SEAT_UNAVAILABLE, details: {seatIds}}
+Http --> Page : throw ApiError(409) (isConflict = true)
+Page -> Page : setConflict(err.message + "seat map refreshed")
+Page -> Poller : refresh()
+Poller -> Http : api.shows.seats(showId)
+Http --> Poller : fresh SeatMap (A1 = LOCKED)
+Poller --> Page : notify(state)
+Page -> Page : pruneUnavailable(selected, seatMap)\n-> A1 removed from selection
+note right of Page
+  The conflict message from the server is kept
+  (setConflict(c => c ?? ...)) so the user sees why.
+end note
+Page -> Grid : render(seatMap, selected = [])
+Grid --> UB : A1 shown as "Held by others" (disabled)
+UB -> Grid : choose another seat and retry
+@enduml
